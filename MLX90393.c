@@ -3,249 +3,161 @@
 #include "Mux.h"
 #include "Screens.h"
 
-uint16_t MOffsetX, MOffsetY, MOffsetZ;
+// Adresse I2C MLX90393 avec A0=A1=0
+#define MLX90393_ADDR_WRITE   0x18
+#define MLX90393_ADDR_READ    0x19
+
+// Commandes
+#define CMD_START_MEAS        0x3F
+#define CMD_READ_MEASUREMENT  0x4E
+#define CMD_READ_REGISTER     0x50
+#define CMD_WRITE_REGISTER    0x60
+
+// Calibration constants (GAIN_SEL = 7, RES = 0)
+#define CALIB_GAIN_XY         0.150f
+#define CALIB_GAIN_Z          0.242f
+
+// Mesure
+uint16_t MOffsetX = 0, MOffsetY = 0, MOffsetZ = 0;
 uint8_t TempsMesure = 0;
-        
-// MLX90393xLW-ABA-011-RE avec A0 et A1 � zero => adresse 0x0Ch
-void init_MLX90393(uint8_t Tint) {
-    
-    uint16_t Reg0, Reg1, Reg2, Reg3;
-    ReadStatus();
-    
-    __delay_ms(75);
-    
-    ReadRegister(GAIN_SEL_REG, &Reg0);
-    
-    // Read reg 1
-    ReadRegister(TCMP_EN_REG, &Reg1);
-    // Disable offset compensation
-    WriteRegister(TCMP_EN_REG, 0);
-    
-    // Read reg 2
-    ReadRegister(OSR_REG, &Reg2);
-    
-    // Single Magnetic axis conversion time: (2+2^DIG_FILT)*2^OSR*0.064
-    // DIG_FILT = 7, OSR = 1 => 50ms  (reduced noise) => 0x1D
-    // DIG_FILT = 5, OSR = 2 => 27ms  (reduced noise) => 0x16
-    if (Tint == 0) {
-        
-        // Page 10 datasheet conv time
-        TempsMesure = 35; //ms
-        WriteRegister(OSR_REG, (Reg2 | (DIG_FLT_MASK+OSR_MASK)) & 0x16);
-    } else {
-        
-        // Page 10 datasheet conv time
-        TempsMesure = 210; //ms
-        WriteRegister(OSR_REG, (Reg2 | (DIG_FLT_MASK+OSR_MASK)) & 0x1F);
-    }
-    
-    // Read reg 2
-    ReadRegister(OSR_REG, &Reg2);
-    
-    // Read reg 3
-    ReadRegister(SENS_TC_LT_REG, &Reg3);
+
+// ----------- Fonctions internes -----------
+
+static int16_t Read16Bit() {
+    int16_t val = ((int16_t)I2C2_read()) << 8;
+    I2C2_ACK();
+    val |= I2C2_read();
+    I2C2_ACK();
+    return val;
 }
 
+static void CalibrateAxis(int16_t* raw, uint16_t offset, float gain) {
+    float val = (float)(*raw - (int16_t)offset) * gain;
+    *raw = (int16_t)(val + 0.5f); // Avec arrondi
+}
 
+// ----------- Initialisation -----------
+
+void init_MLX90393(uint8_t Tint) {
+    uint16_t reg;
+
+    ReadStatus();
+    __delay_ms(75);
+
+    ReadRegister(TCMP_EN_REG, &reg);
+    WriteRegister(TCMP_EN_REG, 0); // Désactivation compensation offset
+
+    ReadRegister(OSR_REG, &reg);
+
+    if (Tint == 0) {
+        TempsMesure = 35;
+        WriteRegister(OSR_REG, (reg | (DIG_FLT_MASK + OSR_MASK)) & 0x16); // OSR=2, DIG_FLT=5
+    } else {
+        TempsMesure = 210;
+        WriteRegister(OSR_REG, (reg | (DIG_FLT_MASK + OSR_MASK)) & 0x1F); // OSR=1, DIG_FLT=7
+    }
+}
+
+// ----------- Mesure XYZ + Température -----------
 
 void GetXYZT(int16_t* X, int16_t* Y, int16_t* Z, uint16_t* T, uint8_t EnableOffset) {
-    
-    uint8_t status;
-    float calib;
-    
-    // Apply Offset
+
     if (EnableOffset == APPLY_OFFSET) {
-        // Read Offsets first
         ReadRegister(X_OFFSET_REG, &MOffsetX);
         ReadRegister(Y_OFFSET_REG, &MOffsetY);
         ReadRegister(Z_OFFSET_REG, &MOffsetZ);
-        
-    // NO_OFFSET
     } else {
-        MOffsetX = 0; 
-        MOffsetY = 0;
-        MOffsetZ = 0; 
+        MOffsetX = MOffsetY = MOffsetZ = 0;
     }
-        
-    // Start Single Measurement Mode
+
+    // Démarrage mesure
     I2C2_start();
-    // Address + Write
-    I2C2_write(0x18);
-    // Start Single Measurement Command
-    I2C2_write(0x3F);
+    I2C2_write(MLX90393_ADDR_WRITE);
+    I2C2_write(CMD_START_MEAS);
     I2C2_stop();
-    
-    // Read Status
-    I2C2_start();
-    // Address + Read
-    I2C2_write(0x19);
-    // read byte
-    status = I2C2_read();
-    I2C2_ACK();
-    I2C2_stop();
-    
-    // Page 10 datasheet conv time
+
     __delay_ms(TempsMesure);
-    
-    // Read Measurement
+
+    // Demande de lecture
     I2C2_start();
-    // Address + Write
-    I2C2_write(0x18);
-    // Read Command
+    I2C2_write(MLX90393_ADDR_WRITE);
     I2C2_write(CMD_READ_MEASUREMENT);
     I2C2_stop();
-    
-    // Read Status
+
     I2C2_start();
-    // Address + Read
-    I2C2_write(0x19);
-    // read byte
-    status = I2C2_read();
-    I2C2_ACK();
+    I2C2_write(MLX90393_ADDR_READ);
+    I2C2_read(); I2C2_ACK(); // Status, ignoré
 
-    // read byte
-    *T = (int16_t)I2C2_read()*256;
-    I2C2_ACK();
+    *T = Read16Bit();
+    *X = Read16Bit();
+    CalibrateAxis(X, MOffsetX, CALIB_GAIN_XY);
+    MOffsetX = *X;
 
-    // read byte
-    *T += I2C2_read();
-    I2C2_ACK();
+    *Y = Read16Bit();
+    CalibrateAxis(Y, MOffsetY, CALIB_GAIN_XY);
+    MOffsetY = *Y;
 
-    // read byte
-    *X = (int16_t)I2C2_read()*256;
-    I2C2_ACK();
+    *Z = Read16Bit();
+    CalibrateAxis(Z, MOffsetZ, CALIB_GAIN_Z);
+    MOffsetZ = *Z;
 
-    // read byte
-    *X += I2C2_read();
-    I2C2_ACK();
-        
-    // apply calibration 0.150 for GAIN_SEL = 7 and RES = 0
-    // page 27 datasheet
-    calib = *X - (int16_t)MOffsetX;
-    calib *= 0.150;
-    MOffsetX = *X;   // Save offset for the end of function
-    *X = calib;
-
-    // read byte
-    *Y = (int16_t)I2C2_read()*256;
-    I2C2_ACK();
-
-    // read byte
-    *Y += I2C2_read();
-    I2C2_ACK();
-
-    // apply calibration 0.150 for GAIN_SEL = 7 and RES = 0
-    // page 27 datasheet
-    calib = *Y - (int16_t)MOffsetY;
-    calib *= 0.150;
-    MOffsetY = *Y;   // Save offset for the end of function
-    *Y = calib;
-    
-    // read byte
-    *Z = (int16_t)I2C2_read()*256;
-    I2C2_ACK();
-
-    // read byte
-    *Z += I2C2_read();
-    I2C2_ACK();
-    
-    // apply calibration 0.242 for GAIN_SEL = 7 and RES = 0
-    // page 27 datasheet
-    calib = *Z - (int16_t)MOffsetZ;
-    calib *= 0.150;
-    MOffsetZ = *Z;     // Save offset for the end of function
-    *Z = calib;
-    
     I2C2_stop();
-    
-    // Save current values as offset
+
     if (EnableOffset == SAVE_OFFSET) {
         WriteRegister(X_OFFSET_REG, MOffsetX);
-        ReadRegister(X_OFFSET_REG, &MOffsetX);
         WriteRegister(Y_OFFSET_REG, MOffsetY);
-        ReadRegister(Y_OFFSET_REG, &MOffsetY);
         WriteRegister(Z_OFFSET_REG, MOffsetZ);
-        ReadRegister(Z_OFFSET_REG, &MOffsetZ);
     }
 }
 
-uint8_t ReadStatus() {
-    
-    uint16_t data;
-    return ReadRegister(GAIN_SEL_REG, &data);
-}
+// ----------- Lecture / Écriture registre -----------
 
-void WriteRegister(uint8_t address, uint16_t data) {
-    
+uint8_t WriteRegister(uint8_t address, uint16_t data) {
     uint8_t status;
-    
+
     I2C2_start();
-    // Address + Write
-    I2C2_write(0x18);
-    // Write Reg
-    I2C2_write(CMD_WRITE_REGISTER);  
-    // MSB
-    I2C2_write(data>>8);
-    // LSB
-    I2C2_write(data);
-    // address
-    I2C2_write(address<<2);
+    I2C2_write(MLX90393_ADDR_WRITE);
+    I2C2_write(CMD_WRITE_REGISTER);
+    I2C2_write(data >> 8);
+    I2C2_write(data & 0xFF);
+    I2C2_write(address << 2);
     I2C2_stop();
-    
-    
-    // Read Status
+
     I2C2_start();
-    // Address + Read
-    I2C2_write(0x19);
-    // read byte
+    I2C2_write(MLX90393_ADDR_READ);
     status = I2C2_read();
-    I2C2_ACK();
-    I2C2_stop();
-}
-
-// Read Register RR 5  0101 0abc {A5...A0,0,0}
-uint8_t ReadRegister(uint8_t address, uint16_t* data) {
-    
-    uint8_t status;
-    
-    I2C2_start();
-    // Address + Write
-    I2C2_write(0x18);    
-    // Address + Write
-    I2C2_write(CMD_READ_REGISTER); 
-    // address : 
-    I2C2_write((address)<<2);    
-    I2C2_stop();
-    
-    // Read Status
-    I2C2_start();
-    // Address + Read
-    I2C2_write(0x19);
-    // read byte
-    status = I2C2_read();
-    I2C2_ACK();
-
-    // read byte
-    *data = (int16_t)I2C2_read()*256;
-    I2C2_ACK();
-
-    // read byte
-    *data += I2C2_read();
     I2C2_ACK();
     I2C2_stop();
 
     return status;
 }
 
-// Test RS bit page 19
-// RS bit As soon as the first status byte is read, 
-// the flag is cleared until the next reset occurs.
-uint8_t IsAlive(void) {
-    
+uint8_t ReadRegister(uint8_t address, uint16_t* data) {
     uint8_t status;
-    status = ReadStatus();
-    
-    // if 1 not alive
-    if (status & 0x04) return false; 
-    else return true;
+
+    I2C2_start();
+    I2C2_write(MLX90393_ADDR_WRITE);
+    I2C2_write(CMD_READ_REGISTER);
+    I2C2_write(address << 2);
+    I2C2_stop();
+
+    I2C2_start();
+    I2C2_write(MLX90393_ADDR_READ);
+    status = I2C2_read();
+    I2C2_ACK();
+    *data = Read16Bit();
+    I2C2_stop();
+
+    return status;
+}
+
+// ----------- Vérification présence capteur -----------
+
+uint8_t ReadStatus(void) {
+    uint16_t dummy;
+    return ReadRegister(GAIN_SEL_REG, &dummy);
+}
+
+uint8_t IsAlive(void) {
+    return !(ReadStatus() & 0x04);
 }
